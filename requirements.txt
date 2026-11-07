@@ -10,3 +10,4 @@ gunicorn
 pytesseract
 Pillow
 PyMuPDF
+opencv-python-headless
