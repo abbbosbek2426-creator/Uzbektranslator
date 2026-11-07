@@ -1,0 +1,8 @@
+
+Flask
+requests
+deep-translator
+python-docx
+openpyxl
+pypdf
+reportlab
