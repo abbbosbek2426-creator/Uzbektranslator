@@ -206,7 +206,19 @@ def webhook():
         pass
     return "OK", 200
 
-if __name__ == "__main__":
+
+if TOKEN:
+    webhook_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") + "/webhook"
+
+    requests.post(
+        API + "setWebhook",
+        json={
+            "url": webhook_url,
+            "secret_token": os.getenv("WEBHOOK_SECRET")
+        },
+        timeout=30
+    )
+    if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
   
