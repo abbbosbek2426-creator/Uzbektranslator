@@ -7,3 +7,6 @@ openpyxl
 pypdf
 reportlab
 gunicorn
+pytesseract
+Pillow
+PyMuPDF
