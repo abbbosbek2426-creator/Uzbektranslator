@@ -1,11 +1,19 @@
 
 import os
+import io
+import hmac
 import logging
 import tempfile
-import requests
-import hmac
 import textwrap
 
+import requests
+import fitz
+import cv2
+import numpy as np
+import pytesseract
+
+from PIL import Image, ImageDraw, ImageFont
+from pytesseract import Output
 from flask import Flask, request
 from deep_translator import GoogleTranslator
 from docx import Document
@@ -13,232 +21,333 @@ from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib import colors
 from xml.sax.saxutils import escape
-
-
-# =========================
-# ASOSIY SOZLAMALAR
-# =========================
 
 TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-
 API = f"https://api.telegram.org/bot{TOKEN}/"
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 19 * 1024 * 1024
+MAX_PAGES = 30
 
-
-# =========================
-# TELEGRAM XABAR YUBORISH
-# =========================
 
 def send_message(chat_id, text):
-    response = requests.post(
+    r = requests.post(
         API + "sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text
-        },
+        json={"chat_id": chat_id, "text": text},
         timeout=30
     )
-    response.raise_for_status()
+    r.raise_for_status()
 
 
 def send_document(chat_id, path, filename):
-    with open(path, "rb") as file:
-        response = requests.post(
+    with open(path, "rb") as f:
+        r = requests.post(
             API + "sendDocument",
             data={"chat_id": chat_id},
-            files={
-                "document": (filename, file)
-            },
+            files={"document": (filename, f)},
             timeout=180
         )
+    r.raise_for_status()
 
-    response.raise_for_status()
-
-
-# =========================
-# MATNNI TARJIMA QILISH
-# =========================
 
 def translate(text):
-    if not isinstance(text, str) or not text.strip():
+    if not text or not text.strip():
         return text
 
-    translator = GoogleTranslator(
-        source="auto",
-        target="uz"
-    )
-
+    translator = GoogleTranslator(source="auto", target="uz")
     result = []
-    chunk = ""
 
-    for paragraph in text.splitlines(keepends=True):
-        if len(chunk) + len(paragraph) > 4000:
-            if chunk.strip():
-                result.append(translator.translate(chunk))
-            chunk = ""
-
-        if len(paragraph) > 4000:
-            if chunk.strip():
-                result.append(translator.translate(chunk))
-                chunk = ""
-
-            for part in textwrap.wrap(
-                paragraph,
-                width=3500,
-                break_long_words=True,
-                break_on_hyphens=False
-            ):
-                result.append(translator.translate(part))
-        else:
-            chunk += paragraph
-
-    if chunk.strip():
-        result.append(translator.translate(chunk))
+    for start in range(0, len(text), 3500):
+        part = text[start:start + 3500]
+        translated = translator.translate(part)
+        result.append(translated or part)
 
     return "\n".join(result)
 
 
-# =========================
-# TELEGRAMDAN FAYL OLISH
-# =========================
-
 def download_file(file_id, destination):
-    info = requests.get(
+    r = requests.get(
         API + "getFile",
         params={"file_id": file_id},
         timeout=30
     )
+    r.raise_for_status()
 
-    info.raise_for_status()
-    data = info.json()
-
+    data = r.json()
     if not data.get("ok"):
         raise Exception("Telegram faylni topmadi")
 
     file_path = data["result"]["file_path"]
+    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
 
-    url = (
-        f"https://api.telegram.org/file/bot"
-        f"{TOKEN}/{file_path}"
-    )
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
 
-    response = requests.get(url, timeout=120)
-    response.raise_for_status()
+    with open(destination, "wb") as f:
+        f.write(r.content)
 
-    with open(destination, "wb") as file:
-        file.write(response.content)
-
-
-# =========================
-# PDF YARATISH
-# =========================
 
 def create_pdf(text, destination):
     styles = getSampleStyleSheet()
-
     font_name = "Helvetica"
 
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf"
-    ]
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
-    for font_path in font_paths:
-        if os.path.exists(font_path):
-            try:
-                pdfmetrics.registerFont(
-                    TTFont("DejaVu", font_path)
-                )
-                font_name = "DejaVu"
-                break
-            except Exception:
-                pass
+    if os.path.exists(font_path):
+        try:
+            pdfmetrics.registerFont(TTFont("DejaVu", font_path))
+            font_name = "DejaVu"
+        except Exception:
+            pass
 
     styles["Normal"].fontName = font_name
     styles["Normal"].fontSize = 9
-    styles["Normal"].leading = 13
 
-    document = SimpleDocTemplate(
-        destination,
-        pagesize=A4,
-        rightMargin=40,
-        leftMargin=40,
-        topMargin=40,
-        bottomMargin=40
-    )
-
+    doc = SimpleDocTemplate(destination, pagesize=A4)
     elements = []
 
     for line in text.splitlines():
         if not line.strip():
             elements.append(Spacer(1, 6))
-            continue
-
-        safe_line = escape(line)
-
-        if font_name == "Helvetica":
-            safe_line = (
-                safe_line.replace("ʻ", "'")
-                .replace("’", "'")
-                .replace("‘", "'")
+        else:
+            elements.append(
+                Paragraph(escape(line), styles["Normal"])
             )
+            elements.append(Spacer(1, 3))
 
-        elements.append(
-            Paragraph(safe_line, styles["Normal"])
-        )
-        elements.append(Spacer(1, 3))
-
-    document.build(elements)
+    doc.build(elements)
 
 
-# =========================
-# PDF TARJIMASI
-# =========================
-
-def translate_pdf(source, destination):
+def translate_text_pdf(source, destination):
     reader = PdfReader(source)
-
-    translated_pages = []
+    pages = []
 
     for page in reader.pages:
         page_text = page.extract_text() or ""
 
         if page_text.strip():
-            translated_pages.append(
-                translate(page_text)
-            )
+            pages.append(translate(page_text))
         else:
-            translated_pages.append(
-                "[Bu sahifada o'qiladigan matn topilmadi]"
-            )
+            pages.append("[Matn topilmadi]")
 
-    create_pdf(
-        "\n\n".join(translated_pages),
-        destination
+    create_pdf("\n\n".join(pages), destination)
+
+
+def load_font(size):
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf"
+    ]
+
+    for path in paths:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+
+    return ImageFont.load_default()
+
+
+def wrap_text(draw, text, font, max_width):
+    words = text.split()
+    lines = []
+    current = ""
+
+    for word in words:
+        test = (current + " " + word).strip()
+        box = draw.textbbox((0, 0), test, font=font)
+
+        if box[2] - box[0] <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+def draw_translation(image, translated, rect):
+    draw = ImageDraw.Draw(image)
+
+    x1, y1, x2, y2 = rect
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+
+    for size in range(25, 9, -1):
+        font = load_font(size)
+        lines = wrap_text(draw, translated, font, width - 8)
+
+        spacing = max(2, size // 5)
+        bbox = draw.multiline_textbbox(
+            (0, 0),
+            "\n".join(lines),
+            font=font,
+            spacing=spacing,
+            align="center"
+        )
+
+        text_height = bbox[3] - bbox[1]
+
+        if text_height <= height - 6:
+            break
+
+    draw.multiline_text(
+        (x1 + width // 2, y1 + height // 2),
+        "\n".join(lines),
+        font=font,
+        fill=(0, 0, 0),
+        anchor="mm",
+        align="center",
+        spacing=spacing
     )
 
 
-# =========================
-# WORD TARJIMASI
-# =========================
+def translate_comic_page(image):
+    image = image.convert("RGB")
+    rgb = np.array(image)
+    data = pytesseract.image_to_data(
+        rgb,
+        lang="eng",
+        config="--psm 11",
+        output_type=Output.DICT
+    )
+
+    groups = {}
+
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+
+        try:
+            confidence = float(data["conf"][i])
+        except Exception:
+            confidence = -1
+
+        if not word or confidence < 35:
+            continue
+
+        key = (
+            data["block_num"][i],
+            data["par_num"][i]
+        )
+
+        groups.setdefault(key, []).append({
+            "text": word,
+            "x": data["left"][i],
+            "y": data["top"][i],
+            "w": data["width"][i],
+            "h": data["height"][i]
+        })
+
+    if not groups:
+        return image
+
+    mask = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    blocks = []
+
+    for words in groups.values():
+        text = " ".join(w["text"] for w in words)
+
+        x1 = min(w["x"] for w in words)
+        y1 = min(w["y"] for w in words)
+        x2 = max(w["x"] + w["w"] for w in words)
+        y2 = max(w["y"] + w["h"] for w in words)
+
+        padding = 5
+        x1 = max(0, x1 - padding)
+        y1 = max(0, y1 - padding)
+        x2 = min(rgb.shape[1], x2 + padding)
+        y2 = min(rgb.shape[0], y2 + padding)
+
+        mask[y1:y2, x1:x2] = 255
+
+        blocks.append((text, (x1, y1, x2, y2)))
+
+    cleaned = cv2.inpaint(
+        rgb,
+        mask,
+        5,
+        cv2.INPAINT_TELEA
+    )
+
+    result = Image.fromarray(cleaned)
+
+    for text, rect in blocks:
+        try:
+            translated = translate(text)
+            draw_translation(result, translated, rect)
+        except Exception:
+            logger.exception("Matn tarjimasida xatolik")
+
+    return result
+
+
+def translate_comic_pdf(source, destination):
+    pdf = fitz.open(source)
+
+    if len(pdf) > MAX_PAGES:
+        raise Exception("PDF sahifalari 30 tadan ko'p")
+
+    output = fitz.open()
+
+    for number, page in enumerate(pdf):
+        logger.info("Komiks sahifasi: %s", number + 1)
+
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(2, 2),
+            alpha=False
+        )
+
+        image = Image.frombytes(
+            "RGB",
+            [pix.width, pix.height],
+            pix.samples
+        )
+
+        translated_image = translate_comic_page(image)
+
+        buffer = io.BytesIO()
+        translated_image.save(buffer, format="JPEG", quality=90)
+
+        new_page = output.new_page(
+            width=page.rect.width,
+            height=page.rect.height
+        )
+
+        new_page.insert_image(
+            new_page.rect,
+            stream=buffer.getvalue()
+        )
+
+    output.save(destination)
+    output.close()
+    pdf.close()
+
+
+def process_pdf(source, destination):
+    reader = PdfReader(source)
+
+    text_count = sum(
+        len(page.extract_text() or "")
+        for page in reader.pages
+    )
+
+    if text_count > 100:
+        translate_text_pdf(source, destination)
+    else:
+        translate_comic_pdf(source, destination)
+
 
 def translate_word(source, destination):
     doc = Document(source)
@@ -256,17 +365,12 @@ def translate_word(source, destination):
     doc.save(destination)
 
 
-# =========================
-# EXCEL TARJIMASI
-# =========================
-
 def translate_excel(source, destination):
     workbook = load_workbook(source)
 
     for sheet in workbook.worksheets:
         for row in sheet.iter_rows():
             for cell in row:
-
                 if (
                     isinstance(cell.value, str)
                     and cell.value.strip()
@@ -277,167 +381,30 @@ def translate_excel(source, destination):
     workbook.save(destination)
 
 
-# =========================
-# FAYLNI QAYTA ISHLASH
-# =========================
-
 def process_file(source, destination, extension):
-
     if extension == ".pdf":
-        translate_pdf(source, destination)
-
+        process_pdf(source, destination)
     elif extension == ".docx":
         translate_word(source, destination)
-
     elif extension == ".xlsx":
         translate_excel(source, destination)
-
     else:
-        raise Exception("Noto'g'ri fayl formati")
+        raise Exception("Noto'g'ri format")
 
-
-# =========================
-# TELEGRAM XABARLARINI
-# QABUL QILISH
-# =========================
-
-def handle_update(update):
-
-    message = update.get("message", {})
-
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-
-    if not chat_id:
-        return
-
-    text = message.get("text", "")
-
-    if text == "/start":
-        send_message(
-            chat_id,
-            "Assalomu alaykum!\n\n"
-            "Men fayllarni o'zbek tiliga tarjima qiluvchi botman.\n\n"
-            "Menga quyidagi fayllarni yuboring:\n"
-            "PDF\n"
-            "Word (DOCX)\n"
-            "Excel (XLSX)\n\n"
-            "Men fayl tilini avtomatik aniqlab, "
-            "o'zbek tiliga tarjima qilaman."
-        )
-        return
-
-    document = message.get("document")
-
-    if not document:
-        send_message(
-            chat_id,
-            "Iltimos, PDF, Word yoki Excel fayl yuboring."
-        )
-        return
-
-    filename = document.get("file_name", "file")
-    extension = os.path.splitext(filename)[1].lower()
-
-    if extension not in [".pdf", ".docx", ".xlsx"]:
-        send_message(
-            chat_id,
-            "Bu format qo'llab-quvvatlanmaydi.\n"
-            "PDF, DOCX yoki XLSX yuboring."
-        )
-        return
-
-    file_size = document.get("file_size", 0)
-
-    if file_size > MAX_FILE_SIZE:
-        send_message(
-            chat_id,
-            "Fayl hajmi 19 MB dan katta.\n"
-            "Iltimos, kichikroq fayl yuboring."
-        )
-        return
-
-    send_message(
-        chat_id,
-        "Faylingiz qabul qilindi.\n"
-        "Tarjima boshlanmoqda, kuting..."
-    )
-
-    try:
-        with tempfile.TemporaryDirectory() as folder:
-
-            source = os.path.join(
-                folder,
-                "original" + extension
-            )
-
-            destination = os.path.join(
-                folder,
-                "translated" + extension
-            )
-
-            download_file(
-                document["file_id"],
-                source
-            )
-
-            process_file(
-                source,
-                destination,
-                extension
-            )
-
-            output_name = (
-                os.path.splitext(filename)[0]
-                + "_uzbek"
-                + extension
-            )
-
-            send_document(
-                chat_id,
-                destination,
-                output_name
-            )
-
-            send_message(
-                chat_id,
-                "Tarjima muvaffaqiyatli tugadi!"
-            )
-
-    except Exception as error:
-        logger.exception("Fayl tarjimasida xatolik")
-
-        send_message(
-            chat_id,
-            "Faylni tarjima qilishda xatolik yuz berdi.\n"
-            "Iltimos, boshqa fayl bilan urinib ko'ring."
-        )
-
-
-# =========================
-# RENDER TEKSHIRUVI
-# =========================
 
 @app.route("/", methods=["GET"])
 def home():
     return "Uzbek Translator Bot ishlayapti!", 200
 
 
-# =========================
-# TELEGRAM WEBHOOK
-# =========================
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
-    received_secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token",
-        ""
+    received = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
     )
 
     if not WEBHOOK_SECRET or not hmac.compare_digest(
-        received_secret,
-        WEBHOOK_SECRET
+        received, WEBHOOK_SECRET
     ):
         return "Forbidden", 403
 
@@ -446,36 +413,88 @@ def webhook():
     try:
         handle_update(update)
     except Exception:
-        logger.exception("Telegram xabarini qayta ishlashda xatolik")
+        logger.exception("Xabarni qayta ishlashda xatolik")
 
     return "OK", 200
 
 
-# =========================
-# WEBHOOKNI TELEGRAMGA ULASH
-# =========================
+def handle_update(update):
+    message = update.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+
+    if not chat_id:
+        return
+
+    if message.get("text") == "/start":
+        send_message(
+            chat_id,
+            "Assalomu alaykum!\n\n"
+            "Men PDF komikslarni ham o'zbekchaga tarjima qilaman.\n\n"
+            "PDF, DOCX yoki XLSX fayl yuboring."
+        )
+        return
+
+    document = message.get("document")
+
+    if not document:
+        send_message(chat_id, "Iltimos, fayl yuboring.")
+        return
+
+    filename = document.get("file_name", "file")
+    extension = os.path.splitext(filename)[1].lower()
+
+    if extension not in [".pdf", ".docx", ".xlsx"]:
+        send_message(chat_id, "PDF, DOCX yoki XLSX yuboring.")
+        return
+
+    if document.get("file_size", 0) > MAX_FILE_SIZE:
+        send_message(chat_id, "Fayl 19 MB dan katta.")
+        return
+
+    send_message(
+        chat_id,
+        "Faylingiz qabul qilindi. Tarjima boshlanmoqda. Kuting..."
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "original" + extension)
+            destination = os.path.join(folder, "translated" + extension)
+
+            download_file(document["file_id"], source)
+            process_file(source, destination, extension)
+
+            output_name = (
+                os.path.splitext(filename)[0]
+                + "_uzbek"
+                + extension
+            )
+
+            send_document(chat_id, destination, output_name)
+            send_message(chat_id, "Tarjima tugadi!")
+
+    except Exception:
+        logger.exception("Fayl tarjimasida xatolik")
+        try:
+            send_message(
+                chat_id,
+                "Tarjima vaqtida xatolik yuz berdi. "
+                "Kichikroq PDF bilan urinib ko'ring."
+            )
+        except Exception:
+            logger.exception("Xatolik xabarini yuborib bo'lmadi")
+
 
 def register_webhook():
-
-    if not TOKEN:
-        logger.error("BOT_TOKEN kiritilmagan")
+    if not TOKEN or not WEBHOOK_SECRET or not RENDER_URL:
+        logger.error("BOT_TOKEN, WEBHOOK_SECRET yoki RENDER URL yo'q")
         return
-
-    if not WEBHOOK_SECRET:
-        logger.error("WEBHOOK_SECRET kiritilmagan")
-        return
-
-    if not RENDER_URL:
-        logger.error("RENDER_EXTERNAL_URL topilmadi")
-        return
-
-    webhook_url = RENDER_URL + "/webhook"
 
     try:
         response = requests.post(
             API + "setWebhook",
             json={
-                "url": webhook_url,
+                "url": RENDER_URL + "/webhook",
                 "secret_token": WEBHOOK_SECRET,
                 "allowed_updates": ["message"]
             },
@@ -484,23 +503,14 @@ def register_webhook():
 
         response.raise_for_status()
 
-        result = response.json()
-
-        if result.get("ok"):
+        if response.json().get("ok"):
             logger.info("Telegram webhook muvaffaqiyatli ulandi")
         else:
-            logger.error("Webhook ulanmadi: %s", result)
+            logger.error("Webhook ulanmagan: %s", response.text)
 
     except Exception:
         logger.exception("Webhook ulashda xatolik")
 
 
-# =========================
-# DASturni ISHGA TUSHIRISH
-# =========================
-
 register_webhook()
-
-if __name__ == "__main__":
-
-    port = int(os.environ.get("PORT", 10000))
+        
